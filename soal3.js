@@ -1,10 +1,14 @@
 const express = require("express");
 const { Client } = require("pg");
 require("dotenv").config();
+
 const app = express();
 const port = 3000;
 
 app.use(express.json());
+
+const USERS_TABLE = process.env.USERS_TABLE || "users";
+const SHOPPING_TABLE = process.env.SHOPPING_TABLE || "belanja";
 
 // Setup Database Connection
 const client = new Client({
@@ -21,27 +25,29 @@ client
   .catch((err) => console.error("Connection error", err.stack));
 
 async function getTopCountry() {
-  // Query a. Munculkan data country mana aja yang spend nya terbanyak
   const query = `
-        SELECT country, COUNT(*) as transaction_count
-        FROM transactions
-        GROUP BY country
-        ORDER BY transaction_count DESC
-        LIMIT 1;
-    `;
+    SELECT u.country, SUM(b.total_buy) AS total_spend, COUNT(*) AS transaction_count
+    FROM ${SHOPPING_TABLE} b
+    JOIN ${USERS_TABLE} u ON u.id = b.id_user
+    GROUP BY u.country
+    ORDER BY total_spend DESC
+    LIMIT 1;
+  `;
+
   const res = await client.query(query);
   return res.rows[0];
 }
 
 async function getTopCardType() {
-  // Query b. Munculkan data jumlah tipe kartu kredit terbanyak
   const query = `
-        SELECT credit_card_type, COUNT(*) as usage_count
-        FROM transactions
-        GROUP BY credit_card_type
-        ORDER BY usage_count DESC
-        LIMIT 1;
-    `;
+    SELECT u.credit_card_type, COUNT(*) AS usage_count
+    FROM ${SHOPPING_TABLE} b
+    JOIN ${USERS_TABLE} u ON u.id = b.id_user
+    GROUP BY u.credit_card_type
+    ORDER BY usage_count DESC
+    LIMIT 1;
+  `;
+
   const res = await client.query(query);
   return res.rows[0];
 }
@@ -51,7 +57,7 @@ async function getTopCardType() {
     const topCountry = await getTopCountry();
     if (topCountry) {
       console.log(
-        `\n[a] Country dengan transaksi terbanyak: ${topCountry.country} (Jumlah: ${topCountry.transaction_count})`,
+        `\n[a] Country dengan total belanja terbanyak: ${topCountry.country} (Total Spend: ${topCountry.total_spend}, Jumlah Transaksi: ${topCountry.transaction_count})`,
       );
     }
 
@@ -62,7 +68,7 @@ async function getTopCardType() {
       );
     }
   } catch (err) {
-    console.error("Error running initial queries:", err);
+    console.error("Error running initial queries:", err.message);
   }
 })();
 
@@ -77,10 +83,20 @@ app.get("/api/top-country-transactions", async (req, res) => {
     const countryName = topCountryData.country;
 
     const queryDetail = `
-        SELECT id, country, credit_card_type, credit_card_number, first_name, last_name
-        FROM transactions
-        WHERE country = $1
+      SELECT
+        b.id,
+        u.country,
+        u.credit_card_type,
+        u.credit_card_number,
+        u.first_name,
+        u.last_name,
+        b.total_buy
+      FROM ${SHOPPING_TABLE} b
+      JOIN ${USERS_TABLE} u ON u.id = b.id_user
+      WHERE u.country = $1
+      ORDER BY b.id;
     `;
+
     const result = await client.query(queryDetail, [countryName]);
 
     const responseData = result.rows.map((row) => ({
@@ -90,16 +106,21 @@ app.get("/api/top-country-transactions", async (req, res) => {
       Credit_card: row.credit_card_number,
       First_name: row.first_name,
       Last_name: row.last_name,
+      Total_buy: row.total_buy,
     }));
 
     res.json({
-      description: `Data transaksi untuk negara dengan spend terbanyak: ${countryName}`,
+      description: `Data transaksi untuk negara dengan total belanja terbanyak: ${countryName}`,
+      total_spend: topCountryData.total_spend,
       total_records: responseData.length,
       data: responseData,
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({
+      error: "Internal Server Error",
+      detail: err.message,
+    });
   }
 });
 
@@ -116,41 +137,60 @@ app.post("/api/transaction", async (req, res) => {
   ) {
     return res.status(400).json({
       error:
-        "Mohon lengkapi semua field (country, credit_card_type, credit_card, first_name, last_name)",
+        "Mohon lengkapi field wajib: country, credit_card_type, credit_card, first_name, last_name",
     });
   }
 
   try {
-    const queryInsert = `
-        INSERT INTO transactions (country, credit_card_type, credit_card_number, first_name, last_name)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, country, credit_card_type, credit_card_number, first_name, last_name
-      `;
-    const values = [
+    await client.query("BEGIN");
+    const insertUserQuery = `
+      INSERT INTO ${USERS_TABLE} (country, credit_card_type, credit_card_number, first_name, last_name)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, country, credit_card_type, credit_card_number, first_name, last_name
+    `;
+
+    const userValues = [
       country,
       credit_card_type,
       credit_card,
       first_name,
       last_name,
     ];
+    const userResult = await client.query(insertUserQuery, userValues);
+    const newUser = userResult.rows[0];
 
-    const result = await client.query(queryInsert, values);
-    const newRecord = result.rows[0];
+    // 2) Insert transaksi belanja default 0 agar relasi dan data transaksi tetap konsisten
+    const insertShoppingQuery = `
+      INSERT INTO ${SHOPPING_TABLE} (id_user, total_buy)
+      VALUES ($1, $2)
+      RETURNING id, total_buy
+    `;
+    const shoppingResult = await client.query(insertShoppingQuery, [
+      newUser.id,
+      0,
+    ]);
+    const newShopping = shoppingResult.rows[0];
+
+    await client.query("COMMIT");
 
     res.status(201).json({
-      message: "Data berhasil ditambahkan",
+      message: "Data transaksi berhasil ditambahkan",
       data: {
-        Id: newRecord.id,
-        Country: newRecord.country,
-        Credit_card_type: newRecord.credit_card_type,
-        Credit_card: newRecord.credit_card_number,
-        First_name: newRecord.first_name,
-        Last_name: newRecord.last_name,
+        Id: newShopping.id,
+        Country: newUser.country,
+        Credit_card_type: newUser.credit_card_type,
+        Credit_card: newUser.credit_card_number,
+        First_name: newUser.first_name,
+        Last_name: newUser.last_name,
       },
     });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ error: "Failed to insert data" });
+    res.status(500).json({
+      error: "Failed to insert data",
+      detail: err.message,
+    });
   }
 });
 

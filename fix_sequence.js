@@ -1,6 +1,9 @@
 const { Client } = require("pg");
 require("dotenv").config();
 
+const USERS_TABLE = process.env.USERS_TABLE || "users";
+const SHOPPING_TABLE = process.env.SHOPPING_TABLE || "belanja";
+
 const client = new Client({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
@@ -9,18 +12,30 @@ const client = new Client({
   port: process.env.DB_PORT,
 });
 
+async function syncSequence(tableName) {
+  const query = `
+    SELECT setval(
+      pg_get_serial_sequence('${tableName}', 'id'),
+      COALESCE((SELECT MAX(id) FROM ${tableName}), 1),
+      true
+    );
+  `;
+
+  await client.query(query);
+}
+
 async function fixSequence() {
   try {
     await client.connect();
     console.log("Connected to PostgreSQL");
 
-    console.log("Fixing id sequence...");
-    await client.query(
-      "SELECT setval('transactions_id_seq', (SELECT MAX(id) FROM transactions));",
-    );
-    console.log("Sequence updated to match MAX(id).");
+    console.log(`Fixing sequences for ${USERS_TABLE} and ${SHOPPING_TABLE}...`);
+    await syncSequence(USERS_TABLE);
+    await syncSequence(SHOPPING_TABLE);
+
+    console.log("Sequences updated to match MAX(id) for both tables.");
   } catch (err) {
-    console.error("Error fixing sequence:", err);
+    console.error("Error fixing sequence:", err.message);
   } finally {
     await client.end();
   }
